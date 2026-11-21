@@ -8,7 +8,7 @@ CFLAGS := -O2 -Wall -Wextra -ffreestanding -fno-builtin -fno-tree-loop-distribut
           -DBUILD_TAG='"$(BUILD_TAG)"'
 LDFLAGS := -T link.ld -Wl,--build-id=none -no-pie -static
 
-all: out/boot_c_safe.img out/boot_c_full.img
+all: out/boot_c_safe.img out/boot_c_full.img out/boot_c_emmc.img
 
 build/safe.elf: start.S main.c font.h link.ld
 	mkdir -p build
@@ -17,6 +17,10 @@ build/safe.elf: start.S main.c font.h link.ld
 build/full.elf: start.S main.c font.h link.ld
 	mkdir -p build
 	$(CC) $(CFLAGS) -DRISKY=1 $(LDFLAGS) start.S main.c -o $@ -lgcc
+
+build/emmc.elf: start.S main.c font.h link.ld
+	mkdir -p build
+	$(CC) $(CFLAGS) -DRISKY=2 $(LDFLAGS) start.S main.c -o $@ -lgcc
 
 build/%.bin: build/%.elf
 	$(OBJCOPY) -O binary $< $@

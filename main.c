@@ -23,12 +23,15 @@ extern void host_secondary(void);
 #define FB_BASE ((uintptr_t)host_fb)
 #define SYSREG(n) fake_sysreg(#n)
 #define RD32(a) host_rd32(a)
+#define WR32(a,v) host_wr32((a),(v))
+extern void host_wr32(u64 addr, u32 v);
 #define WFI() do {} while (0)
 #define DSB() do {} while (0)
 #else
 #define FB_BASE 0x9D400000UL
 #define SYSREG(n) ({ u64 _v; __asm__ volatile("mrs %0, " #n : "=r"(_v)); _v; })
 #define RD32(a) (*(volatile u32 *)(uintptr_t)(a))
+#define WR32(a,v) (*(volatile u32 *)(uintptr_t)(a) = (v))
 #define WFI() __asm__ volatile("wfi")
 #define DSB() __asm__ volatile("dsb sy" ::: "memory")
 #endif
@@ -124,6 +127,7 @@ static u64 gic_base;           /* first reg of first interrupt-controller@ node 
 static u64 gicr_base;          /* second reg entry of it */
 static u64 cpu_reg[8]; static u32 ncpu;
 static u64 sdhci_base;
+static u64 sdhci_reg[4], sdhci_regsz[4]; static u32 sdhci_nreg; static const char *sdhci_regnames; static u32 sdhci_regnames_len;
 
 struct nstk { char name[48]; u32 ac, sc; };
 
@@ -141,7 +145,7 @@ static void fdt_walk(const u8 *dtb, int verbose) {
     if (be32(dtb) != 0xd00dfeed) { bad("DTB BAD MAGIC\n"); return; }
     u32 total = be32(dtb + 4), off_st = be32(dtb + 8), off_str = be32(dtb + 12), sz_st = be32(dtb + 36);
     const u8 *p = dtb + off_st, *end = p + sz_st; const char *strs = (const char *)(dtb + off_str);
-    static struct nstk st[16]; int depth = -1, sel_depth = -1; u32 nodes = 0, nsel = 0, nrsv = 0;
+    static struct nstk st[16]; int depth = -1, sel_depth = -1, sdhci_cur = 0, sdhci_done = 0; u32 nodes = 0, nsel = 0, nrsv = 0;
     if (verbose) kprintf("DTB @%llx size %x ver %u\n", (u64)(uintptr_t)dtb, total, be32(dtb + 20));
     while (p < end) {
         u32 tag = be32(p); p += 4;
@@ -150,12 +154,12 @@ static void fdt_walk(const u8 *dtb, int verbose) {
             depth++; if (depth >= 16) { bad("DTB TOO DEEP\n"); return; }
             u32 i = 0; while (nm[i] && i < 47) { st[depth].name[i] = nm[i]; i++; } st[depth].name[i] = 0;
             st[depth].ac = 2; st[depth].sc = 1; nodes++;
-            sel_depth = -1;
+            sel_depth = -1; sdhci_cur = 0; if (depth == 2 && !sdhci_done && startswith(nm, "sdhci@")) { sdhci_cur = 1; sdhci_done = 1; }
             if (depth == 2 && (startswith(nm, "interrupt-controller@") || startswith(nm, "sdhci@") ||
                                streq(nm, "timer") || contains(nm, "mdss_mdp@") || startswith(nm, "serial@")) && nsel < 12) {
                 sel_depth = depth; nsel++;
             }
-        } else if (tag == 2) { depth--; sel_depth = -1; }
+        } else if (tag == 2) { depth--; sel_depth = -1; sdhci_cur = 0; }
         else if (tag == 3) {
             u32 len = be32(p), noff = be32(p + 4); p += 8; const u8 *val = p; p += (len + 3) & ~3u;
             const char *pn = strs + noff; char path[96]; build_path(st, depth, path, sizeof path);
@@ -185,7 +189,13 @@ static void fdt_walk(const u8 *dtb, int verbose) {
                 gic_base = rcells(val, pac);
                 if (len >= (pac + psc) * 8) gicr_base = rcells(val + (pac + psc) * 4, pac);
             }
-            if (startswith(st[depth].name, "sdhci@") && depth == 2 && streq(pn, "reg") && !sdhci_base) sdhci_base = rcells(val, pac);
+            if (sdhci_cur) {
+                if (streq(pn, "reg")) {
+                    sdhci_base = rcells(val, pac);
+                    u32 ent = (pac + psc) * 4;
+                    for (u32 o = 0; o + ent <= len && sdhci_nreg < 4; o += ent) { sdhci_reg[sdhci_nreg] = rcells(val + o, pac); sdhci_regsz[sdhci_nreg++] = rcells(val + o + pac * 4, psc); }
+                } else if (streq(pn, "reg-names")) { sdhci_regnames = (const char *)val; sdhci_regnames_len = len; }
+            }
         } else if (tag == 4) { }
         else break;
     }
@@ -253,14 +263,85 @@ static void risky_tests(void) {
     if (sdhci_base) kprintf("eMMC controller @%llx (not touched yet)\n", sdhci_base);
 }
 
+
+/* ------------------------------------------------------------ eMMC (SDHCI, PIO) test */
+static u32 sect[128];
+static int sdhci_read_sector(u64 b, u64 lba, u32 *buf, u32 *err) {
+    u32 n;
+    for (n = 0; n < 2000000; n++) if (!(RD32(b + 0x24) & 3)) break;
+    if (n == 2000000) { *err = 0xE0000001; return -1; }
+    WR32(b + 0x30, 0xFFFFFFFF);
+    WR32(b + 0x04, (1u << 16) | 512);
+    WR32(b + 0x08, (u32)lba);
+    WR32(b + 0x0C, (0x113Au << 16) | 0x0010u);          /* CMD17, R1, data present; read direction, PIO */
+    u32 s = 0;
+    for (n = 0; n < 4000000; n++) { s = RD32(b + 0x30); if (s & 0x8000) { *err = s; return -2; } if (s & 0x20) break; }
+    if (n == 4000000) { *err = s | 0xE0000002; return -3; }
+    for (u32 i = 0; i < 128; i++) buf[i] = RD32(b + 0x20);
+    for (n = 0; n < 4000000; n++) { s = RD32(b + 0x30); if (s & 2) break; }
+    WR32(b + 0x30, 0xFFFFFFFF);
+    if (n == 4000000) { *err = 0xE0000003; return -4; }
+    return 0;
+}
+static u64 le64(const u8 *p) { u64 v = 0; for (int i = 7; i >= 0; i--) v = (v << 8) | p[i]; return v; }
+static u32 le32(const u8 *p) { return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24); }
+
+static void emmc_test(void) {
+    u64 b = sdhci_base ? sdhci_base : 0xC0C4000;
+    kprintf("sdhci reg:"); for (u32 i = 0; i < sdhci_nreg; i++) kprintf(" %llx+%llx", sdhci_reg[i], sdhci_regsz[i]); kprintf("\n");
+    if (sdhci_regnames) { kprintf("names:"); const char *p = sdhci_regnames; u32 k = 0; while (k < sdhci_regnames_len) { kprintf(" %.12s", p); u32 l = (u32)strlen(p) + 1; p += l; k += l; } kprintf("\n"); }
+    kprintf("touching eMMC @%llx ...\n", b);
+    kprintf("24 PRESENT %08x\n", RD32(b + 0x24));
+    kprintf("28 HC/PWR  %08x\n", RD32(b + 0x28));
+    kprintf("2C CLOCK   %08x\n", RD32(b + 0x2C));
+    kprintf("30 INTST   %08x\n", RD32(b + 0x30));
+    kprintf("3C HC2     %08x\n", RD32(b + 0x3C));
+    kprintf("40 CAPS    %08x %08x\n", RD32(b + 0x40), RD32(b + 0x44));
+    kprintf("FC VERSION %08x\n", RD32(b + 0xFC));
+    u32 err = 0;
+    kprintf("read LBA0: ");
+    int r = sdhci_read_sector(b, 0, sect, &err);
+    if (r) { bad("FAIL"); kprintf(" r=%d err=%08x\n", r, err); return; }
+    ok("OK"); kprintf(" sig(510)=%04x\n", ((const u8 *)sect)[510] | (((const u8 *)sect)[511] << 8));
+    kprintf("read LBA1: ");
+    r = sdhci_read_sector(b, 1, sect, &err);
+    if (r) { bad("FAIL"); kprintf(" r=%d err=%08x\n", r, err); return; }
+    const u8 *h = (const u8 *)sect;
+    if (memcmp(h, "EFI PART", 8)) { bad("no GPT"); kprintf(" %02x %02x %02x %02x\n", h[0], h[1], h[2], h[3]); return; }
+    ok("GPT OK\n");
+    u64 eslba = le64(h + 72); u32 ecount = le32(h + 80), esize = le32(h + 84);
+    kprintf("GPT entries %u x %u B @LBA %llu\n", ecount, esize, eslba);
+    static const char *want[] = { "boot", "recovery", "userdata", "system", "vendor", "persist", "modem", "cache", "dtbo", "vbmeta", 0 };
+    u32 found = 0, total = 0;
+    for (u32 i = 0; i < ecount && esize >= 128; i += 512 / esize) {
+        if (sdhci_read_sector(b, eslba + (u64)i * esize / 512, sect, &err)) { bad("entry read FAIL\n"); kprintf(" err=%08x\n", err); break; }
+        for (u32 k = 0; k < 512 / esize; k++) {
+            const u8 *e = (const u8 *)sect + k * esize;
+            u32 any = 0; for (int q = 0; q < 16; q++) any |= e[q];
+            if (!any) continue;
+            total++;
+            char name[37]; for (int q = 0; q < 36; q++) name[q] = (char)e[56 + q * 2]; name[36] = 0;
+            for (int w = 0; want[w]; w++) if (streq(name, want[w])) {
+                u64 f = le64(e + 32), l = le64(e + 40);
+                kprintf("%s %llx-%llx %lluMB\n", name, f, l, (l - f + 1) / 2048); found++;
+            }
+        }
+    }
+    kprintf("partitions: %u (listed %u)\n", total, found);
+}
+
 void kmain(const void *dtb) {
     fb_clear();
-    kcolor(C_CYAN); kprintf("KB LOADER (C) %s %s\n", BUILD_TAG, RISKY ? "FULL" : "SAFE"); kcolor(C_WHITE);
+    kcolor(C_CYAN); kprintf("KB LOADER (C) %s %s\n", BUILD_TAG, RISKY == 2 ? "EMMC" : RISKY ? "FULL" : "SAFE"); kcolor(C_WHITE);
+#if RISKY != 2
     cpu_info();
+#endif
     kprintf("x0(DTB) = %llx\n", (u64)(uintptr_t)dtb);
-    fdt_walk((const u8 *)dtb, !RISKY);
-#if RISKY
+    fdt_walk((const u8 *)dtb, RISKY == 0);
+#if RISKY == 1
     risky_tests();
+#elif RISKY == 2
+    emmc_test();
 #endif
     kcolor(C_YEL); kprintf("\nDONE. Photo the screen.\n"); kcolor(C_WHITE);
     for (;;) { WFI();
