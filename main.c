@@ -25,6 +25,7 @@ extern void host_secondary(void);
 #define RD32(a) host_rd32(a)
 #define WR32(a,v) host_wr32((a),(v))
 extern void host_wr32(u64 addr, u32 v);
+#define WR8(a,v) do { } while (0)
 #define WFI() do {} while (0)
 #define DSB() do {} while (0)
 #else
@@ -32,6 +33,7 @@ extern void host_wr32(u64 addr, u32 v);
 #define SYSREG(n) ({ u64 _v; __asm__ volatile("mrs %0, " #n : "=r"(_v)); _v; })
 #define RD32(a) (*(volatile u32 *)(uintptr_t)(a))
 #define WR32(a,v) (*(volatile u32 *)(uintptr_t)(a) = (v))
+#define WR8(a,v) (*(volatile u8 *)(uintptr_t)(a) = (u8)(v))
 #define WFI() __asm__ volatile("wfi")
 #define DSB() __asm__ volatile("dsb sy" ::: "memory")
 #endif
@@ -264,57 +266,86 @@ static void risky_tests(void) {
 }
 
 
-/* ------------------------------------------------------------ eMMC (SDHCI, PIO) test */
+/* ------------------------------------------------------------ eMMC (SDHCI) test: PIO first, ADMA2 fallback */
 static u32 sect[128];
-static int sdhci_read_sector(u64 b, u64 lba, u32 *buf, u32 *err) {
-    u32 n;
+static u32 adma_desc[4] __attribute__((aligned(8)));
+static u32 dbg_int, dbg_pres;
+
+static int sdhci_reset_lines(u64 b) {
+    WR8(b + 0x2F, 0x06);                               /* software reset CMD + DAT lines */
+    for (u32 n = 0; n < 1000000; n++) if (!(((RD32(b + 0x2C) >> 24) & 6))) return 0;
+    return -1;
+}
+/* returns 0 ok, 1 ok but Transfer Complete never seen, <0 failure */
+static int sdhci_xfer(u64 b, u64 lba, u32 *buf, int adma, u32 *err) {
+    u32 n, s = 0; *err = 0; dbg_int = 0;
     for (n = 0; n < 2000000; n++) if (!(RD32(b + 0x24) & 3)) break;
+    dbg_pres = RD32(b + 0x24);
     if (n == 2000000) { *err = 0xE0000001; return -1; }
     WR32(b + 0x30, 0xFFFFFFFF);
     WR32(b + 0x04, (1u << 16) | 512);
     WR32(b + 0x08, (u32)lba);
-    WR32(b + 0x0C, (0x113Au << 16) | 0x0010u);          /* CMD17, R1, data present; read direction, PIO */
-    u32 s = 0;
-    for (n = 0; n < 4000000; n++) { s = RD32(b + 0x30); if (s & 0x8000) { *err = s; return -2; } if (s & 0x20) break; }
-    if (n == 4000000) { *err = s | 0xE0000002; return -3; }
+    if (adma) {
+        u64 a = (u64)(uintptr_t)buf, d = (u64)(uintptr_t)adma_desc;
+        adma_desc[0] = (512u << 16) | 0x23;            /* valid | end | transfer */
+        adma_desc[1] = (u32)a; adma_desc[2] = (u32)(a >> 32); adma_desc[3] = 0;
+        DSB();
+        WR32(b + 0x58, (u32)d); WR32(b + 0x5C, (u32)(d >> 32));
+        WR32(b + 0x0C, (0x113Au << 16) | 0x0013u);     /* CMD17, read, DMA + block count enable */
+        for (n = 0; n < 4000000; n++) { s = RD32(b + 0x30); if (s & 0x8000) { *err = s; dbg_int = s; return -2; } if (s & 2) break; }
+        dbg_int = s; dbg_pres = RD32(b + 0x24);
+        if (n == 4000000) { *err = 0xE0000004; return -5; }
+        WR32(b + 0x30, 0xFFFFFFFF);
+        return 0;
+    }
+    WR32(b + 0x0C, (0x113Au << 16) | 0x0010u);         /* CMD17, read, PIO */
+    for (n = 0; n < 4000000; n++) { s = RD32(b + 0x30); if (s & 0x8000) { *err = s; dbg_int = s; return -2; } if (s & 0x20) break; }
+    if (n == 4000000) { *err = s | 0xE0000002; dbg_int = s; dbg_pres = RD32(b + 0x24); return -3; }
     for (u32 i = 0; i < 128; i++) buf[i] = RD32(b + 0x20);
-    for (n = 0; n < 4000000; n++) { s = RD32(b + 0x30); if (s & 2) break; }
+    for (n = 0; n < 300000; n++) { s = RD32(b + 0x30); if (s & 2) break; }
+    dbg_int = s; dbg_pres = RD32(b + 0x24);
+    int r = (s & 2) ? 0 : 1;
+    if (r) sdhci_reset_lines(b);
     WR32(b + 0x30, 0xFFFFFFFF);
-    if (n == 4000000) { *err = 0xE0000003; return -4; }
-    return 0;
+    return r;
 }
 static u64 le64(const u8 *p) { u64 v = 0; for (int i = 7; i >= 0; i--) v = (v << 8) | p[i]; return v; }
 static u32 le32(const u8 *p) { return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24); }
 
+static void show_sec(const char *tag, int r, u32 err) {
+    kprintf("%s: ", tag);
+    if (r < 0) { bad("FAIL"); kprintf(" r=%d err=%08x\n", r, err); }
+    else if (r) { kcolor(C_YEL); kprintf("OK, no TC\n"); kcolor(C_WHITE); }
+    else { ok("OK\n"); }
+    kprintf("  INT %08x PRES %08x\n  %08x %08x %08x %08x\n  [508] %08x\n", dbg_int, dbg_pres, sect[0], sect[1], sect[2], sect[3], sect[127]);
+}
+
 static void emmc_test(void) {
     u64 b = sdhci_base ? sdhci_base : 0xC0C4000;
     kprintf("sdhci reg:"); for (u32 i = 0; i < sdhci_nreg; i++) kprintf(" %llx+%llx", sdhci_reg[i], sdhci_regsz[i]); kprintf("\n");
-    if (sdhci_regnames) { kprintf("names:"); const char *p = sdhci_regnames; u32 k = 0; while (k < sdhci_regnames_len) { kprintf(" %.12s", p); u32 l = (u32)strlen(p) + 1; p += l; k += l; } kprintf("\n"); }
     kprintf("touching eMMC @%llx ...\n", b);
-    kprintf("24 PRESENT %08x\n", RD32(b + 0x24));
-    kprintf("28 HC/PWR  %08x\n", RD32(b + 0x28));
-    kprintf("2C CLOCK   %08x\n", RD32(b + 0x2C));
-    kprintf("30 INTST   %08x\n", RD32(b + 0x30));
-    kprintf("3C HC2     %08x\n", RD32(b + 0x3C));
-    kprintf("40 CAPS    %08x %08x\n", RD32(b + 0x40), RD32(b + 0x44));
-    kprintf("FC VERSION %08x\n", RD32(b + 0xFC));
-    u32 err = 0;
-    kprintf("read LBA0: ");
-    int r = sdhci_read_sector(b, 0, sect, &err);
-    if (r) { bad("FAIL"); kprintf(" r=%d err=%08x\n", r, err); return; }
-    ok("OK"); kprintf(" sig(510)=%04x\n", ((const u8 *)sect)[510] | (((const u8 *)sect)[511] << 8));
-    kprintf("read LBA1: ");
-    r = sdhci_read_sector(b, 1, sect, &err);
-    if (r) { bad("FAIL"); kprintf(" r=%d err=%08x\n", r, err); return; }
+    kprintf("PRES %08x HC/PWR %08x CLK %08x\n", RD32(b + 0x24), RD32(b + 0x28), RD32(b + 0x2C));
+    kprintf("INT %08x EN %08x SIG %08x HC2 %08x\n", RD32(b + 0x30), RD32(b + 0x34), RD32(b + 0x38), RD32(b + 0x3C));
+    WR32(b + 0x34, RD32(b + 0x34) | 0x037F003B);         /* latch CC, TC, DMA, BWR, BRR + error status bits (no interrupts: SIG untouched) */
+    kprintf("INT enable now %08x\n", RD32(b + 0x34));
+    u32 err = 0; int mode = -1, r;
+    r = sdhci_xfer(b, 0, sect, 0, &err); show_sec("PIO LBA0", r, err);
+    r = sdhci_xfer(b, 1, sect, 0, &err); show_sec("PIO LBA1", r, err);
+    if (r >= 0 && !memcmp(sect, "EFI PART", 8)) mode = 0;
+    else {
+        r = sdhci_xfer(b, 1, sect, 1, &err); show_sec("ADMA LBA1", r, err);
+        if (r >= 0 && !memcmp(sect, "EFI PART", 8)) mode = 1;
+    }
+    if (mode < 0) { bad("no GPT found\n"); return; }
+    ok("GPT OK"); kprintf(" via %s\n", mode ? "ADMA" : "PIO");
+    sdhci_xfer(b, 1, sect, mode, &err);
     const u8 *h = (const u8 *)sect;
-    if (memcmp(h, "EFI PART", 8)) { bad("no GPT"); kprintf(" %02x %02x %02x %02x\n", h[0], h[1], h[2], h[3]); return; }
-    ok("GPT OK\n");
     u64 eslba = le64(h + 72); u32 ecount = le32(h + 80), esize = le32(h + 84);
     kprintf("GPT entries %u x %u B @LBA %llu\n", ecount, esize, eslba);
     static const char *want[] = { "boot", "recovery", "userdata", "system", "vendor", "persist", "modem", "cache", "dtbo", "vbmeta", 0 };
     u32 found = 0, total = 0;
     for (u32 i = 0; i < ecount && esize >= 128; i += 512 / esize) {
-        if (sdhci_read_sector(b, eslba + (u64)i * esize / 512, sect, &err)) { bad("entry read FAIL\n"); kprintf(" err=%08x\n", err); break; }
+        if (sdhci_xfer(b, eslba + (u64)i * esize / 512, sect, mode, &err) < 0) { bad("entry read FAIL\n"); kprintf(" err=%08x\n", err); break; }
         for (u32 k = 0; k < 512 / esize; k++) {
             const u8 *e = (const u8 *)sect + k * esize;
             u32 any = 0; for (int q = 0; q < 16; q++) any |= e[q];
