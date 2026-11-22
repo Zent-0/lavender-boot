@@ -30,6 +30,15 @@ extern void host_wr32(u64 addr, u32 v);
 #define TEST_BRK() do { exc_seen = 1; } while (0)
 #define WFI() do {} while (0)
 #define DSB() do {} while (0)
+#define ISB() do {} while (0)
+extern void host_pump_irq(void);
+extern u64 host_mpidr;
+#define IRQ_ON()  host_pump_irq()
+#define IRQ_OFF() do {} while (0)
+#define GICSR_R(enc) ((u64)27)
+#define GICSR_W(enc, v) do { (void)(v); } while (0)
+#define CNTV_ARM(tv) do { (void)(tv); } while (0)
+#define CNTV_OFF() do {} while (0)
 #else
 #define FB_BASE 0x9D400000UL
 #define SYSREG(n) ({ u64 _v; __asm__ volatile("mrs %0, " #n : "=r"(_v)); _v; })
@@ -40,6 +49,13 @@ extern void host_wr32(u64 addr, u32 v);
 #define TEST_BRK() __asm__ volatile("brk #0")
 #define WFI() __asm__ volatile("wfi")
 #define DSB() __asm__ volatile("dsb sy" ::: "memory")
+#define ISB() __asm__ volatile("isb" ::: "memory")
+#define IRQ_ON()  __asm__ volatile("msr daifclr, #2" ::: "memory")
+#define IRQ_OFF() __asm__ volatile("msr daifset, #2" ::: "memory")
+#define GICSR_R(enc) ({ u64 _v; __asm__ volatile("mrs %0, " #enc : "=r"(_v)); _v; })
+#define GICSR_W(enc, v) __asm__ volatile("msr " #enc ", %0" :: "r"((u64)(v)) : "memory")
+#define CNTV_ARM(tv) do { __asm__ volatile("msr cntv_tval_el0, %0" :: "r"((u64)(tv))); __asm__ volatile("msr cntv_ctl_el0, %0" :: "r"((u64)1)); __asm__ volatile("isb"); } while (0)
+#define CNTV_OFF() do { __asm__ volatile("msr cntv_ctl_el0, %0" :: "r"((u64)2)); __asm__ volatile("isb"); } while (0)
 #endif
 
 extern u64 smc_call(u64 fn, u64 a1, u64 a2, u64 a3);
@@ -237,7 +253,9 @@ static void cpu_info(void) {
 /* ------------------------------------------------------------ risky hardware tests */
 static volatile u32 cpu1_flag; static volatile u64 cpu1_mpidr;
 static u8 cpu1_stack[4096] __attribute__((aligned(16)));
+#if RISKY != 5
 void secondary_main(void) { cpu1_mpidr = SYSREG(mpidr_el1); DSB(); cpu1_flag = 1; DSB(); }
+#endif
 
 static u64 cnt(void) { u64 a = SYSREG(cntvct_el0), b = SYSREG(cntvct_el0); return ((a ^ b) >> 32) ? a : b; }
 
@@ -287,6 +305,13 @@ static u32 dma_area[2048] __attribute__((aligned(4096)));
 #define sect      ((u32 *)(DMA_PTR))
 #define adma_desc ((u32 *)(DMA_PTR + 0x400))
 #define wbuf      ((u8 *)(DMA_PTR + 0x800))
+struct smp_shared {
+    volatile u32 state[8], ticks[8], other[8], pend[8], tctl[8];
+    volatile u64 mpidr[8], midr[8], rd[8], exc_esr[8], exc_elr[8], exc_far[8];
+};
+#define SHARED ((struct smp_shared *)(DMA_PTR + 0x1000))
+static u32 cpu_id_of(u64 mp) { return (u32)(((mp & 0xff) + 4 * ((mp >> 8) & 0xff)) & 7); }
+static void irq_handler(void);
 static u32 dbg_int;
 static u64 emmc_base;
 
@@ -377,6 +402,9 @@ static int log_flush(void) {
 static volatile u32 exc_seen;
 void exc_handler(u64 type, u64 esr, u64 far, u64 elr);
 void exc_handler(u64 type, u64 esr, u64 far, u64 elr) {
+    if (type == 5) { irq_handler(); return; }                           /* IRQ from current EL (SPx) */
+    u32 id = cpu_id_of(SYSREG(mpidr_el1));
+    if (id != 0) { SHARED->exc_esr[id] = esr; SHARED->exc_far[id] = far; SHARED->exc_elr[id] = elr; DSB(); for (;;) WFI(); }
     kcolor(C_RED); kprintf("\nEXC t%llu ESR %llx FAR %llx ELR %llx\n", type, esr, far, elr); kcolor(C_WHITE);
     if ((esr >> 26) == 0x3C) { exc_seen = 1; SET_ELR(elr + 4); return; }     /* BRK test: resume after it */
     log_flush();
@@ -384,20 +412,30 @@ void exc_handler(u64 type, u64 esr, u64 far, u64 elr) {
 }
 
 /* ---- stage bookkeeping + large summary ---- */
-static const char *stg_name[12]; static int stg_res[12]; static int nstg;
+static const char *stg_name[16]; static int stg_res[16]; static int nstg;
 static void stage(const char *name, int pass) {
-    if (nstg < 12) { stg_name[nstg] = name; stg_res[nstg++] = pass; }
+    if (nstg < 16) { stg_name[nstg] = name; stg_res[nstg++] = pass; }
     kprintf("[%s] ", name); if (pass) ok("OK\n"); else bad("FAIL\n");
 }
 static void summary(void) {
     kscale = 2; kprintf("\n");
-    for (int i = 0; i < nstg; i++) { kcolor(stg_res[i] ? C_GREEN : C_RED); kprintf("%s %s\n", stg_name[i], stg_res[i] ? "OK" : "FAIL"); }
+    for (int i = 0; i < nstg; i += 2) {
+        for (int j = i; j < i + 2 && j < nstg; j++) {
+            kcolor(stg_res[j] ? C_GREEN : C_RED);
+            u32 len = (u32)strlen(stg_name[j]) + (stg_res[j] ? 3 : 5);
+            kprintf("%s %s", stg_name[j], stg_res[j] ? "OK" : "FAIL");
+            for (; len < 12; len++) kputc(' ');
+        }
+        kputc('\n');
+    }
     kscale = 1; kcolor(C_WHITE);
 }
 
 /* ---- MMU + caches (identity map) ---- */
 static u64 cnt(void);
 #ifdef HOST_TEST
+static void mmu_build(void) { }
+static int mmu_on(void) { return 1; }
 static int mmu_enable(void) { kprintf("(host: MMU skipped)\n"); return 1; }
 #else
 static u64 l1_tab[512] __attribute__((aligned(4096)));
@@ -412,17 +450,21 @@ static void dcache_inval(u64 start, u64 len) {
     for (u64 a = start & ~63ULL; a < start + len; a += 64) __asm__ volatile("dc ivac, %0" :: "r"(a) : "memory");
     __asm__ volatile("dsb sy" ::: "memory");
 }
-static int mmu_enable(void) {
+static void mmu_build(void) {
     /* attr idx: 0 = Device-nGnRnE, 1 = Normal WB, 2 = Normal non-cacheable */
     memset(l1_tab, 0, sizeof l1_tab); memset(l2_tab, 0, sizeof l2_tab);
     l1_tab[0] = 0x00000000ULL | PTE_BLK | PTE_AF | PTE_IDX(0) | PTE_XN;            /* 0..1G   peripherals */
     l1_tab[1] = 0x40000000ULL | PTE_BLK | PTE_AF | PTE_IDX(0) | PTE_XN;            /* 1..2G   peripherals */
     l1_tab[2] = (u64)(uintptr_t)l2_tab | PTE_TBL;                                   /* 2..3G   RAM bank 0  */
     for (u64 i = 0; i < 16; i++) l2_tab[i]      = (0x80000000ULL + i * 0x200000) | PTE_BLK | PTE_AF | PTE_ISH | PTE_IDX(1);                 /* 32 MiB WB: image, stack, tables */
-    for (u64 i = 16; i < 32; i++) l2_tab[i]     = (0x80000000ULL + i * 0x200000) | PTE_BLK | PTE_AF | PTE_ISH | PTE_IDX(2) | PTE_XN;        /* 32 MiB NC: DMA buffers */
+    for (u64 i = 16; i < 32; i++) l2_tab[i]     = (0x80000000ULL + i * 0x200000) | PTE_BLK | PTE_AF | PTE_ISH | PTE_IDX(2) | PTE_XN;        /* 32 MiB NC: DMA + shared buffers */
     for (u64 i = 234; i < 252; i++) l2_tab[i]   = (0x80000000ULL + i * 0x200000) | PTE_BLK | PTE_AF | PTE_IDX(0) | PTE_XN;                    /* framebuffer 0x9d400000.. as device */
     dcache_inval(0x80000000ULL, 0x200000);          /* drop stale lines over our image / bss / stack / tables */
     dcache_inval(0x82100000ULL, 0x10000);           /* and over the DMA buffers */
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+/* turn the MMU + caches on for the calling CPU (tables must already be built) */
+static int mmu_on(void) {
     u64 mair = 0x44FF00ULL;
     u64 tcr  = 25ULL | (1ULL << 8) | (1ULL << 10) | (3ULL << 12) | (1ULL << 23) | (2ULL << 32);   /* 39-bit VA, 4K, WB walks, 40-bit PA */
     u64 ttbr = (u64)(uintptr_t)l1_tab;
@@ -444,7 +486,96 @@ static int mmu_enable(void) {
         :: "r"(mair), "r"(tcr), "r"(ttbr), "r"(sctlr) : "memory");
     return (SYSREG(sctlr_el1) & 0x1005) == 0x1005;
 }
+static int mmu_enable(void) { mmu_build(); return mmu_on(); }
 #endif
+/* ------------------------------------------------------------ GICv3 + virtual timer IRQ + SMP bring-up */
+static u64 gicd_base, gicr_base_addr;
+#define TIMER_TICKS_WANTED 5
+
+static void gicd_wait_rwp(void) { for (u32 n = 0; n < 1000000; n++) if (!(RD32(gicd_base) & (1u << 31))) return; }
+static int gic_dist_init(void) {
+    WR32(gicd_base, 1u << 4);                                   /* ARE_NS while disabled */
+    gicd_wait_rwp();
+    WR32(gicd_base, (1u << 4) | (1u << 1) | (1u << 0));         /* ARE_NS + Group1 enables */
+    gicd_wait_rwp();
+    return (RD32(gicd_base) & (1u << 4)) ? 0 : -1;
+}
+/* find this CPU's redistributor frame by affinity */
+static u64 gic_find_rd(u64 mp) {
+    u32 aff = (u32)((((mp >> 32) & 0xff) << 24) | (mp & 0x00ffffff));
+    for (u64 p = gicr_base_addr; p < gicr_base_addr + 0x100000; ) {
+        u32 lo = RD32(p + 8), hi = RD32(p + 12);
+        if (hi == aff) return p;
+        if (lo & (1u << 4)) break;                               /* Last */
+        p += (lo & 2) ? 0x40000 : 0x20000;                      /* VLPIS => 4 frames */
+    }
+    return 0;
+}
+static int gic_rd_init(u64 rd) {
+    u32 w = RD32(rd + 0x14); WR32(rd + 0x14, w & ~(1u << 1));    /* wake: clear ProcessorSleep */
+    u32 n; for (n = 0; n < 1000000; n++) if (!(RD32(rd + 0x14) & (1u << 2))) break;
+    if (n == 1000000) return -1;
+    u64 sgi = rd + 0x10000;
+    WR32(sgi + 0x180, 0xFFFFFFFF);                               /* ICENABLER0: all private IRQs off */
+    WR32(sgi + 0x280, 0xFFFFFFFF);                               /* ICPENDR0 */
+    WR32(sgi + 0x380, 0xFFFFFFFF);                               /* ICACTIVER0 */
+    for (u32 i = 0; i < 32; i += 4) WR32(sgi + 0x400 + i, 0xA0A0A0A0);   /* priorities */
+    for (n = 0; n < 1000000; n++) if (!(RD32(rd) & (1u << 3))) break;   /* GICR_CTLR.RWP */
+    return 0;
+}
+static int gic_cpuif_init(void) {
+    u64 sre = GICSR_R(S3_0_C12_C12_5);
+    GICSR_W(S3_0_C12_C12_5, sre | 1);                            /* ICC_SRE_EL1.SRE */
+    ISB();
+    if (!(GICSR_R(S3_0_C12_C12_5) & 1)) return -1;
+    GICSR_W(S3_0_C4_C6_0, 0xF0);                                 /* ICC_PMR_EL1 */
+    GICSR_W(S3_0_C12_C12_3, 0);                                  /* ICC_BPR1_EL1 */
+    GICSR_W(S3_0_C12_C12_4, 0);                                  /* ICC_CTLR_EL1: EOImode 0 */
+    GICSR_W(S3_0_C12_C12_7, 1);                                  /* ICC_IGRPEN1_EL1 */
+    ISB();
+    return 0;
+}
+static void irq_handler(void) {
+    u64 iar = GICSR_R(S3_0_C12_C12_0);                           /* ICC_IAR1_EL1 */
+    u32 id = (u32)(iar & 0xFFFFFF), c = cpu_id_of(SYSREG(mpidr_el1));
+    if (id == 27) {                                              /* virtual timer PPI */
+        CNTV_OFF();
+        u32 t = SHARED->ticks[c] + 1; SHARED->ticks[c] = t;
+        if (t < TIMER_TICKS_WANTED) CNTV_ARM(SYSREG(cntfrq_el0) / 100);   /* re-arm for 10 ms */
+        GICSR_W(S3_0_C12_C12_1, iar);                            /* ICC_EOIR1_EL1 */
+    } else if (id < 1020) { SHARED->other[c] = id; GICSR_W(S3_0_C12_C12_1, iar); }
+    else SHARED->other[c] = id;                                  /* spurious */
+}
+/* per-CPU body, shared by core 0 and the secondaries */
+static void cpu_body(u32 id, u64 mp, int secondary) {
+    SHARED->mpidr[id] = mp; SHARED->midr[id] = SYSREG(midr_el1); SHARED->state[id] |= 1; DSB();
+    if (secondary) { if (!mmu_on()) return; }
+    SHARED->state[id] |= 2; DSB();
+    u64 rd = gic_find_rd(mp); SHARED->rd[id] = rd;
+    if (!rd || gic_rd_init(rd) < 0) return;
+    SHARED->state[id] |= 4; DSB();
+    if (gic_cpuif_init() < 0) return;
+    SHARED->state[id] |= 8; DSB();
+    SHARED->ticks[id] = 0;
+    WR32(rd + 0x10000 + 0x100, 1u << 27);                        /* ISENABLER0: virtual timer PPI (INTID 27) */
+    CNTV_ARM(SYSREG(cntfrq_el0) / 100);
+    IRQ_ON();
+    u64 f = SYSREG(cntfrq_el0), t0 = cnt();
+    while (SHARED->ticks[id] < TIMER_TICKS_WANTED && (cnt() - t0) < f / 2) { }
+    IRQ_OFF(); CNTV_OFF();
+    SHARED->pend[id] = RD32(rd + 0x10000 + 0x200); SHARED->tctl[id] = 0;
+    if (SHARED->ticks[id] >= TIMER_TICKS_WANTED) SHARED->state[id] |= 16;
+    DSB();
+}
+#if RISKY == 5
+static u8 cpu_stack[8][8192] __attribute__((aligned(16)));
+void secondary_main(void) { u64 mp = SYSREG(mpidr_el1); cpu_body(cpu_id_of(mp), mp, 1); for (;;) WFI(); }
+#endif
+#ifdef HOST_TEST
+void host_pump_irq(void) { for (int i = 0; i < TIMER_TICKS_WANTED; i++) irq_handler(); }
+void host_cpu_started(u64 mp) { u64 keep = host_mpidr; host_mpidr = mp | 0x80000000ULL; cpu_body(cpu_id_of(mp), host_mpidr, 1); host_mpidr = keep; }
+#endif
+
 static u8 memtest[65536];
 
 #if RISKY >= 3
@@ -459,11 +590,11 @@ static void stage_main(const u8 *dtb) {
     int gpt = (r >= 0 && !memcmp(sect, "EFI PART", 8));
     stage("EMMC", r >= 0); if (r < 0) kprintf("  err %08x INT %08x\n", err, dbg_int);
     stage("GPT", gpt);
-    int total = gpt ? gpt_scan(emmc_base, 1) : -9;
+    int total = gpt ? gpt_scan(emmc_base, RISKY != 5) : -9;
     kprintf("partitions: %d  logdump: %s\n", total, have_log ? "found" : "MISSING");
     int lr = log_flush(); stage("LOG", lr == 0); if (lr) kprintf("  log_flush -> %d\n", lr);
 
-#if RISKY == 4
+#if RISKY >= 4
     kprintf("entering MMU stage...\n"); log_flush();          /* persist everything so far before the risky step */
     int m = mmu_enable();
     stage("MMU", m);
@@ -480,15 +611,47 @@ static void stage_main(const u8 *dtb) {
         stage("RAM", bad_n == 0); kprintf("  4x64KB fill+check %llu us\n", (t1 - t0) * 1000000ULL / f);
     }
 #endif
+#if RISKY == 5
+    if (m) {
+        gicd_base = gic_base ? gic_base : 0x17A00000ULL; gicr_base_addr = gicr_base ? gicr_base : 0x17B00000ULL;
+        kprintf("GICD %llx GICR %llx\n", gicd_base, gicr_base_addr); log_flush();
+        int d = gic_dist_init(); stage("GICD", d == 0);
+        kprintf("  CTLR %08x TYPER %08x\n", RD32(gicd_base), RD32(gicd_base + 4));
+        cpu_body(0, SYSREG(mpidr_el1), 0);
+        u32 st = SHARED->state[0];
+        stage("GICR", (st & 4) != 0); stage("GICC", (st & 8) != 0); stage("IRQ", (st & 16) != 0);
+        kprintf("  rd %llx ticks %u other %u pend %08x\n", SHARED->rd[0], SHARED->ticks[0], SHARED->other[0], SHARED->pend[0]);
+        log_flush();
+        u32 up = 0; s64 cr[8] = {0};
+        for (u32 i = 1; i < ncpu && i < 8; i++) {
+            cr[i] = (s64)smc_call(0xC4000003, cpu_reg[i], (u64)(uintptr_t)secondary_entry, (u64)(uintptr_t)(cpu_stack[i] + sizeof cpu_stack[i]));
+#ifdef HOST_TEST
+            host_cpu_started(cpu_reg[i]);
+#endif
+        }
+        u64 f2 = SYSREG(cntfrq_el0), tt0 = cnt();
+        for (;;) {
+            u32 done = 0; for (u32 i = 1; i < ncpu && i < 8; i++) if (SHARED->state[i] & 16) done++;
+            if (done == ncpu - 1 || (cnt() - tt0) > f2 * 2) break;
+        }
+        for (u32 i = 1; i < ncpu && i < 8; i++) {
+            u32 s2 = SHARED->state[cpu_id_of(cpu_reg[i])];
+            kprintf("c%u on%d mp%llx m%llx s%x t%u\n", i, (int)cr[i], SHARED->mpidr[i], SHARED->midr[i], s2, SHARED->ticks[i]);
+            if (SHARED->exc_esr[i]) kprintf("  EXC esr %llx elr %llx far %llx\n", SHARED->exc_esr[i], SHARED->exc_elr[i], SHARED->exc_far[i]);
+            if (s2 & 16) up++;
+        }
+        stage("SMP", ncpu > 1 && up == ncpu - 1);
+    }
+#endif
     summary();
     int fr = log_flush(); kprintf("final log flush: %d\n", fr);
 }
 #endif
 
-#define SRC_VER "src5"
+#define SRC_VER "src6"
 void kmain(const void *dtb) {
     fb_clear();
-    kcolor(C_CYAN); kprintf("KB LOADER (C) %s %s %s\n", BUILD_TAG, RISKY == 4 ? "MMU" : RISKY == 3 ? "LOG" : RISKY ? "FULL" : "SAFE", SRC_VER); kcolor(C_WHITE);
+    kcolor(C_CYAN); kprintf("KB LOADER (C) %s %s %s\n", BUILD_TAG, RISKY == 5 ? "IRQ" : RISKY == 4 ? "MMU" : RISKY == 3 ? "LOG" : RISKY ? "FULL" : "SAFE", SRC_VER); kcolor(C_WHITE);
 #if RISKY < 3
     cpu_info();
 #endif

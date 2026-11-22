@@ -45,6 +45,10 @@ smc_call:
     .global secondary_entry
 secondary_entry:
     msr     daifset, #0xf
+    msr     spsel, #1
+    adrp    x1, vectors
+    add     x1, x1, :lo12:vectors
+    msr     vbar_el1, x1
     mov     sp, x0
     bl      secondary_main
 4:  wfe
