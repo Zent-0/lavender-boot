@@ -2,7 +2,7 @@ ENTRY(_start)
 SECTIONS
 {
     . = 0x80080000;
-    .text : { *(.text.boot) *(.text .text.*) }
+    .text : { *(.text.boot) *(.text.vectors) *(.text .text.*) }
     .rodata : { *(.rodata .rodata.*) }
     .data : { *(.data .data.*) }
     . = ALIGN(16);

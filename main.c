@@ -26,6 +26,8 @@ extern void host_secondary(void);
 #define WR32(a,v) host_wr32((a),(v))
 extern void host_wr32(u64 addr, u32 v);
 #define WR8(a,v) do { } while (0)
+#define SET_ELR(v) do { } while (0)
+#define TEST_BRK() do { exc_seen = 1; } while (0)
 #define WFI() do {} while (0)
 #define DSB() do {} while (0)
 #else
@@ -34,6 +36,8 @@ extern void host_wr32(u64 addr, u32 v);
 #define RD32(a) (*(volatile u32 *)(uintptr_t)(a))
 #define WR32(a,v) (*(volatile u32 *)(uintptr_t)(a) = (v))
 #define WR8(a,v) (*(volatile u8 *)(uintptr_t)(a) = (u8)(v))
+#define SET_ELR(v) __asm__ volatile("msr elr_el1, %0" :: "r"((u64)(v)))
+#define TEST_BRK() __asm__ volatile("brk #0")
 #define WFI() __asm__ volatile("wfi")
 #define DSB() __asm__ volatile("dsb sy" ::: "memory")
 #endif
@@ -58,7 +62,8 @@ static int startswith(const char *s, const char *p) { while (*p) { if (*s++ != *
 static int contains(const char *s, const char *p) { size_t n = strlen(p); for (; *s; s++) if (!memcmp(s, p, n)) return 1; return 0; }
 
 /* ------------------------------------------------------------ console */
-static u32 cur_col, cur_row, fg = 0x00FFFFFF, bg = 0x00000000;
+static u32 cur_col, cur_row, kscale = 1, fg = 0x00FFFFFF, bg = 0x00000000;
+static char logbuf[16384]; static u32 loglen;
 #define C_WHITE 0x00FFFFFF
 #define C_GREEN 0x0040FF40
 #define C_RED   0x00FF4040
@@ -74,16 +79,22 @@ static void put_glyph(u32 col, u32 row, char c) {
     const unsigned char *g = font_data[c - 32];
     volatile u32 *dst = (volatile u32 *)(FB_BASE + (u64)(MARGIN_Y + row * FONT_H) * FB_STRIDE + (MARGIN_X + col * FONT_W) * 4);
     for (u32 y = 0; y < FONT_H; y++) {
-        for (u32 x = 0; x < FONT_W; x++)
-            dst[x] = ((g[y * FONT_ROWBYTES + (x >> 3)] >> (7 - (x & 7))) & 1) ? fg : bg;
-        dst += FB_STRIDE / 4;
+        for (u32 sy = 0; sy < kscale; sy++) {
+            for (u32 x = 0; x < FONT_W; x++) {
+                u32 px = ((g[y * FONT_ROWBYTES + (x >> 3)] >> (7 - (x & 7))) & 1) ? fg : bg;
+                for (u32 sx = 0; sx < kscale; sx++) dst[x * kscale + sx] = px;
+            }
+            dst += FB_STRIDE / 4;
+        }
     }
 }
 static void kputc(char c) {
-    if (c == '\n') { cur_col = 0; cur_row++; return; }
-    if (cur_col >= COLS) { cur_col = 0; cur_row++; }
-    if (cur_row >= ROWS) return;
-    put_glyph(cur_col++, cur_row, c);
+    if (loglen < sizeof logbuf - 1) logbuf[loglen++] = c;
+    if (c == '\n') { cur_col = 0; cur_row += kscale; return; }
+    if (cur_col + kscale > COLS) { cur_col = 0; cur_row += kscale; }
+    if (cur_row + kscale > ROWS) return;
+    put_glyph(cur_col, cur_row, c);
+    cur_col += kscale;
 }
 static void kputs_n(const char *s, int max) { while (*s && max-- != 0) kputc(*s++); }
 static void kcolor(u32 c) { fg = c; }
@@ -266,115 +277,231 @@ static void risky_tests(void) {
 }
 
 
-/* ------------------------------------------------------------ eMMC (SDHCI) test: PIO first, ADMA2 fallback */
-static u32 sect[128];
-static u32 adma_desc[4] __attribute__((aligned(8)));
-static u32 dbg_int, dbg_pres;
+/* ------------------------------------------------------------ eMMC (SDHCI, ADMA2) driver */
+#ifdef HOST_TEST
+static u32 dma_area[2048] __attribute__((aligned(4096)));
+#define DMA_PTR ((u8 *)dma_area)
+#else
+#define DMA_PTR ((u8 *)0x82100000UL)         /* RAM block mapped non-cacheable when the MMU is on */
+#endif
+#define sect      ((u32 *)(DMA_PTR))
+#define adma_desc ((u32 *)(DMA_PTR + 0x400))
+#define wbuf      ((u8 *)(DMA_PTR + 0x800))
+static u32 dbg_int;
+static u64 emmc_base;
 
 static int sdhci_reset_lines(u64 b) {
-    WR8(b + 0x2F, 0x06);                               /* software reset CMD + DAT lines */
+    WR8(b + 0x2F, 0x06);                                /* software reset CMD + DAT lines */
     for (u32 n = 0; n < 1000000; n++) if (!(((RD32(b + 0x2C) >> 24) & 6))) return 0;
     return -1;
 }
-/* returns 0 ok, 1 ok but Transfer Complete never seen, <0 failure */
-static int sdhci_xfer(u64 b, u64 lba, u32 *buf, int adma, u32 *err) {
+/* one 512-byte block via ADMA2. returns 0 ok, <0 failure */
+static int sdhci_xfer(u64 b, u64 lba, u32 *buf, int write, u32 *err) {
     u32 n, s = 0; *err = 0; dbg_int = 0;
     for (n = 0; n < 2000000; n++) if (!(RD32(b + 0x24) & 3)) break;
-    dbg_pres = RD32(b + 0x24);
     if (n == 2000000) { *err = 0xE0000001; return -1; }
     WR32(b + 0x30, 0xFFFFFFFF);
     WR32(b + 0x04, (1u << 16) | 512);
     WR32(b + 0x08, (u32)lba);
-    if (adma) {
-        u64 a = (u64)(uintptr_t)buf, d = (u64)(uintptr_t)adma_desc;
-        adma_desc[0] = (512u << 16) | 0x23;            /* valid | end | transfer */
-        adma_desc[1] = (u32)a; adma_desc[2] = (u32)(a >> 32); adma_desc[3] = 0;
-        DSB();
-        WR32(b + 0x58, (u32)d); WR32(b + 0x5C, (u32)(d >> 32));
-        WR32(b + 0x0C, (0x113Au << 16) | 0x0013u);     /* CMD17, read, DMA + block count enable */
-        for (n = 0; n < 4000000; n++) { s = RD32(b + 0x30); if (s & 0x8000) { *err = s; dbg_int = s; return -2; } if (s & 2) break; }
-        dbg_int = s; dbg_pres = RD32(b + 0x24);
-        if (n == 4000000) { *err = 0xE0000004; return -5; }
-        WR32(b + 0x30, 0xFFFFFFFF);
-        return 0;
-    }
-    WR32(b + 0x0C, (0x113Au << 16) | 0x0010u);         /* CMD17, read, PIO */
-    for (n = 0; n < 4000000; n++) { s = RD32(b + 0x30); if (s & 0x8000) { *err = s; dbg_int = s; return -2; } if (s & 0x20) break; }
-    if (n == 4000000) { *err = s | 0xE0000002; dbg_int = s; dbg_pres = RD32(b + 0x24); return -3; }
-    for (u32 i = 0; i < 128; i++) buf[i] = RD32(b + 0x20);
-    for (n = 0; n < 300000; n++) { s = RD32(b + 0x30); if (s & 2) break; }
-    dbg_int = s; dbg_pres = RD32(b + 0x24);
-    int r = (s & 2) ? 0 : 1;
-    if (r) sdhci_reset_lines(b);
+    u64 a = (u64)(uintptr_t)buf, d = (u64)(uintptr_t)adma_desc;
+    adma_desc[0] = (512u << 16) | 0x23;                 /* valid | end | transfer */
+    adma_desc[1] = (u32)a; adma_desc[2] = (u32)(a >> 32); adma_desc[3] = 0;
+    DSB();
+    WR32(b + 0x58, (u32)d); WR32(b + 0x5C, (u32)(d >> 32));
+    WR32(b + 0x0C, ((write ? 0x183Au : 0x113Au) << 16) | (write ? 0x0003u : 0x0013u));   /* CMD24 / CMD17, DMA + block count */
+    for (n = 0; n < 4000000; n++) { s = RD32(b + 0x30); if (s & 0x8000) { *err = s; dbg_int = s; sdhci_reset_lines(b); return -2; } if (s & 2) break; }
+    dbg_int = s;
+    if (n == 4000000) { *err = 0xE0000004; sdhci_reset_lines(b); return -5; }
     WR32(b + 0x30, 0xFFFFFFFF);
-    return r;
+    if (write) {                                        /* wait until the card releases DAT0 (programming done) */
+        for (n = 0; n < 4000000; n++) if (RD32(b + 0x24) & (1u << 20)) break;
+        if (n == 4000000) { *err = 0xE0000005; return -6; }
+    }
+    return 0;
 }
 static u64 le64(const u8 *p) { u64 v = 0; for (int i = 7; i >= 0; i--) v = (v << 8) | p[i]; return v; }
 static u32 le32(const u8 *p) { return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24); }
 
-static void show_sec(const char *tag, int r, u32 err) {
-    kprintf("%s: ", tag);
-    if (r < 0) { bad("FAIL"); kprintf(" r=%d err=%08x\n", r, err); }
-    else if (r) { kcolor(C_YEL); kprintf("OK, no TC\n"); kcolor(C_WHITE); }
-    else { ok("OK\n"); }
-    kprintf("  INT %08x PRES %08x\n  %08x %08x %08x %08x\n  [508] %08x\n", dbg_int, dbg_pres, sect[0], sect[1], sect[2], sect[3], sect[127]);
-}
-
-static void emmc_test(void) {
-    u64 b = sdhci_base ? sdhci_base : 0xC0C4000;
-    kprintf("sdhci reg:"); for (u32 i = 0; i < sdhci_nreg; i++) kprintf(" %llx+%llx", sdhci_reg[i], sdhci_regsz[i]); kprintf("\n");
-    kprintf("touching eMMC @%llx ...\n", b);
-    kprintf("PRES %08x HC/PWR %08x CLK %08x\n", RD32(b + 0x24), RD32(b + 0x28), RD32(b + 0x2C));
-    kprintf("INT %08x EN %08x SIG %08x HC2 %08x\n", RD32(b + 0x30), RD32(b + 0x34), RD32(b + 0x38), RD32(b + 0x3C));
-    WR32(b + 0x34, RD32(b + 0x34) | 0x037F003B);         /* latch CC, TC, DMA, BWR, BRR + error status bits (no interrupts: SIG untouched) */
-    kprintf("INT enable now %08x\n", RD32(b + 0x34));
-    u32 err = 0; int mode = -1, r;
-    r = sdhci_xfer(b, 0, sect, 0, &err); show_sec("PIO LBA0", r, err);
-    r = sdhci_xfer(b, 1, sect, 0, &err); show_sec("PIO LBA1", r, err);
-    if (r >= 0 && !memcmp(sect, "EFI PART", 8)) mode = 0;
-    else {
-        r = sdhci_xfer(b, 1, sect, 1, &err); show_sec("ADMA LBA1", r, err);
-        if (r >= 0 && !memcmp(sect, "EFI PART", 8)) mode = 1;
-    }
-    if (mode < 0) { bad("no GPT found\n"); return; }
-    ok("GPT OK"); kprintf(" via %s\n", mode ? "ADMA" : "PIO");
-    sdhci_xfer(b, 1, sect, mode, &err);
-    const u8 *h = (const u8 *)sect;
+/* ---- GPT scan: lists key partitions, remembers the exact-name "logdump" partition ---- */
+static u64 log_first, log_last; static int have_log, seen_boot, seen_ud;
+static int gpt_scan(u64 b, int list) {
+    u32 err; const u8 *h;
+    if (sdhci_xfer(b, 1, sect, 0, &err) < 0) return -1;
+    h = (const u8 *)sect;
+    if (memcmp(h, "EFI PART", 8)) return -2;
     u64 eslba = le64(h + 72); u32 ecount = le32(h + 80), esize = le32(h + 84);
-    kprintf("GPT entries %u x %u B @LBA %llu\n", ecount, esize, eslba);
-    static const char *want[] = { "boot", "recovery", "userdata", "system", "vendor", "persist", "modem", "cache", "dtbo", "vbmeta", 0 };
-    u32 found = 0, total = 0;
-    for (u32 i = 0; i < ecount && esize >= 128; i += 512 / esize) {
-        if (sdhci_xfer(b, eslba + (u64)i * esize / 512, sect, mode, &err) < 0) { bad("entry read FAIL\n"); kprintf(" err=%08x\n", err); break; }
+    if (esize < 128 || esize > 512 || ecount > 256) return -3;
+    static const char *want[] = { "boot", "recovery", "userdata", "system", "vendor", "persist", "cache", 0 };
+    u32 total = 0;
+    for (u32 i = 0; i < ecount; i += 512 / esize) {
+        if (sdhci_xfer(b, eslba + (u64)i * esize / 512, sect, 0, &err) < 0) return -4;
         for (u32 k = 0; k < 512 / esize; k++) {
             const u8 *e = (const u8 *)sect + k * esize;
             u32 any = 0; for (int q = 0; q < 16; q++) any |= e[q];
             if (!any) continue;
             total++;
             char name[37]; for (int q = 0; q < 36; q++) name[q] = (char)e[56 + q * 2]; name[36] = 0;
-            for (int w = 0; want[w]; w++) if (streq(name, want[w])) {
-                u64 f = le64(e + 32), l = le64(e + 40);
-                kprintf("%s %llx-%llx %lluMB\n", name, f, l, (l - f + 1) / 2048); found++;
-            }
+            u64 f = le64(e + 32), l = le64(e + 40);
+            if (streq(name, "boot")) seen_boot = 1;
+            if (streq(name, "userdata")) seen_ud = 1;
+            if (streq(name, "logdump")) { log_first = f; log_last = l; have_log = 1; kprintf("logdump %llx-%llx %lluMB\n", f, l, (l - f + 1) / 2048); }
+            else if (list) for (int w = 0; want[w]; w++) if (streq(name, want[w])) kprintf("%s %llx-%llx %lluMB\n", name, f, l, (l - f + 1) / 2048);
         }
     }
-    kprintf("partitions: %u (listed %u)\n", total, found);
+    if (!(seen_boot && seen_ud && total >= 10 && log_first >= 2048)) have_log = 0;      /* refuse to write unless the table looks right */
+    return (int)total;
 }
 
+/* ---- persist the on-screen log into the first 16 KiB of the logdump partition (bounds-checked) ---- */
+static int log_flush(void) {
+    if (!have_log || !emmc_base) return -1;
+    if (log_last < log_first || (log_last - log_first + 1) < 2048) return -2;       /* need >= 1 MiB */
+    u32 nsec = (loglen + 511) / 512; if (!nsec) nsec = 1; if (nsec > 32) nsec = 32;
+    u32 err;
+    for (u32 s = 0; s < nsec; s++) {
+        u64 lba = log_first + s;
+        if (lba < log_first || lba > log_last) return -3;
+        u32 off = s * 512, n = loglen > off ? loglen - off : 0; if (n > 512) n = 512;
+        memset(wbuf, 0, 512); memcpy(wbuf, logbuf + off, n);
+        if (sdhci_xfer(emmc_base, lba, (u32 *)wbuf, 1, &err) < 0) return -4;
+    }
+    for (u32 s = 0; s < nsec; s++) {
+        u32 off = s * 512, n = loglen > off ? loglen - off : 0; if (n > 512) n = 512;
+        if (sdhci_xfer(emmc_base, log_first + s, sect, 0, &err) < 0) return -5;
+        if (memcmp(sect, logbuf + off, n)) return -6;
+    }
+    return 0;
+}
+
+/* ---- exceptions: vectors live in start.S, they call this ---- */
+static volatile u32 exc_seen;
+void exc_handler(u64 type, u64 esr, u64 far, u64 elr);
+void exc_handler(u64 type, u64 esr, u64 far, u64 elr) {
+    kcolor(C_RED); kprintf("\nEXC t%llu ESR %llx FAR %llx ELR %llx\n", type, esr, far, elr); kcolor(C_WHITE);
+    if ((esr >> 26) == 0x3C) { exc_seen = 1; SET_ELR(elr + 4); return; }     /* BRK test: resume after it */
+    log_flush();
+    for (;;) WFI();
+}
+
+/* ---- stage bookkeeping + large summary ---- */
+static const char *stg_name[12]; static int stg_res[12]; static int nstg;
+static void stage(const char *name, int pass) {
+    if (nstg < 12) { stg_name[nstg] = name; stg_res[nstg++] = pass; }
+    kprintf("[%s] ", name); if (pass) ok("OK\n"); else bad("FAIL\n");
+}
+static void summary(void) {
+    kscale = 2; kprintf("\n");
+    for (int i = 0; i < nstg; i++) { kcolor(stg_res[i] ? C_GREEN : C_RED); kprintf("%s %s\n", stg_name[i], stg_res[i] ? "OK" : "FAIL"); }
+    kscale = 1; kcolor(C_WHITE);
+}
+
+/* ---- MMU + caches (identity map) ---- */
+static u64 cnt(void);
+#ifdef HOST_TEST
+static int mmu_enable(void) { kprintf("(host: MMU skipped)\n"); return 1; }
+#else
+static u64 l1_tab[512] __attribute__((aligned(4096)));
+static u64 l2_tab[512] __attribute__((aligned(4096)));
+#define PTE_BLK   0x1ULL
+#define PTE_TBL   0x3ULL
+#define PTE_AF    (1ULL << 10)
+#define PTE_ISH   (3ULL << 8)
+#define PTE_XN    ((1ULL << 53) | (1ULL << 54))
+#define PTE_IDX(i) ((u64)(i) << 2)
+static void dcache_inval(u64 start, u64 len) {
+    for (u64 a = start & ~63ULL; a < start + len; a += 64) __asm__ volatile("dc ivac, %0" :: "r"(a) : "memory");
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+static int mmu_enable(void) {
+    /* attr idx: 0 = Device-nGnRnE, 1 = Normal WB, 2 = Normal non-cacheable */
+    memset(l1_tab, 0, sizeof l1_tab); memset(l2_tab, 0, sizeof l2_tab);
+    l1_tab[0] = 0x00000000ULL | PTE_BLK | PTE_AF | PTE_IDX(0) | PTE_XN;            /* 0..1G   peripherals */
+    l1_tab[1] = 0x40000000ULL | PTE_BLK | PTE_AF | PTE_IDX(0) | PTE_XN;            /* 1..2G   peripherals */
+    l1_tab[2] = (u64)(uintptr_t)l2_tab | PTE_TBL;                                   /* 2..3G   RAM bank 0  */
+    for (u64 i = 0; i < 16; i++) l2_tab[i]      = (0x80000000ULL + i * 0x200000) | PTE_BLK | PTE_AF | PTE_ISH | PTE_IDX(1);                 /* 32 MiB WB: image, stack, tables */
+    for (u64 i = 16; i < 32; i++) l2_tab[i]     = (0x80000000ULL + i * 0x200000) | PTE_BLK | PTE_AF | PTE_ISH | PTE_IDX(2) | PTE_XN;        /* 32 MiB NC: DMA buffers */
+    for (u64 i = 234; i < 252; i++) l2_tab[i]   = (0x80000000ULL + i * 0x200000) | PTE_BLK | PTE_AF | PTE_IDX(0) | PTE_XN;                    /* framebuffer 0x9d400000.. as device */
+    dcache_inval(0x80000000ULL, 0x200000);          /* drop stale lines over our image / bss / stack / tables */
+    dcache_inval(0x82100000ULL, 0x10000);           /* and over the DMA buffers */
+    u64 mair = 0x44FF00ULL;
+    u64 tcr  = 25ULL | (1ULL << 8) | (1ULL << 10) | (3ULL << 12) | (1ULL << 23) | (2ULL << 32);   /* 39-bit VA, 4K, WB walks, 40-bit PA */
+    u64 ttbr = (u64)(uintptr_t)l1_tab;
+    u64 sctlr = SYSREG(sctlr_el1); sctlr |= (1ULL << 0) | (1ULL << 2) | (1ULL << 12); sctlr &= ~(1ULL << 19);
+    __asm__ volatile(
+        "dsb sy\n"
+        "msr mair_el1, %0\n"
+        "msr tcr_el1, %1\n"
+        "msr ttbr0_el1, %2\n"
+        "isb\n"
+        "tlbi vmalle1\n"
+        "dsb nsh\n"
+        "isb\n"
+        "ic iallu\n"
+        "dsb nsh\n"
+        "isb\n"
+        "msr sctlr_el1, %3\n"
+        "isb\n"
+        :: "r"(mair), "r"(tcr), "r"(ttbr), "r"(sctlr) : "memory");
+    return (SYSREG(sctlr_el1) & 0x1005) == 0x1005;
+}
+#endif
+static u8 memtest[65536];
+
+#if RISKY >= 3
+static void stage_main(const u8 *dtb) {
+    fdt_walk(dtb, 0);
+    kprintf("EL%llu MIDR %llx MPIDR %llx\n", SYSREG(currentel) >> 2, SYSREG(midr_el1), SYSREG(mpidr_el1));
+    exc_seen = 0; TEST_BRK(); stage("EXC", exc_seen);
+
+    emmc_base = sdhci_base ? sdhci_base : 0xC0C4000;
+    WR32(emmc_base + 0x34, RD32(emmc_base + 0x34) | 0x037F003B);       /* latch CC/TC/BRR + error status bits (no interrupts) */
+    u32 err = 0; int r = sdhci_xfer(emmc_base, 1, sect, 0, &err);
+    int gpt = (r >= 0 && !memcmp(sect, "EFI PART", 8));
+    stage("EMMC", r >= 0); if (r < 0) kprintf("  err %08x INT %08x\n", err, dbg_int);
+    stage("GPT", gpt);
+    int total = gpt ? gpt_scan(emmc_base, 1) : -9;
+    kprintf("partitions: %d  logdump: %s\n", total, have_log ? "found" : "MISSING");
+    int lr = log_flush(); stage("LOG", lr == 0); if (lr) kprintf("  log_flush -> %d\n", lr);
+
+#if RISKY == 4
+    kprintf("entering MMU stage...\n"); log_flush();          /* persist everything so far before the risky step */
+    int m = mmu_enable();
+    stage("MMU", m);
+    if (m) {
+        kprintf("SCTLR now %08llx\n", SYSREG(sctlr_el1));
+        r = sdhci_xfer(emmc_base, 1, sect, 0, &err);
+        stage("EMMC2", r >= 0 && !memcmp(sect, "EFI PART", 8));
+        u64 f = SYSREG(cntfrq_el0), t0 = cnt(), t1 = t0;
+        for (u64 i = 0; i < 400000000ULL && (t1 - t0) < f / 10; i++) t1 = cnt();
+        stage("TIMER", (t1 - t0) >= f / 10);
+        t0 = cnt(); u32 bad_n = 0;
+        for (u32 p = 0; p < 4; p++) { for (u32 i = 0; i < sizeof memtest; i++) memtest[i] = (u8)(i * 7 + p); for (u32 i = 0; i < sizeof memtest; i++) if (memtest[i] != (u8)(i * 7 + p)) bad_n++; }
+        t1 = cnt();
+        stage("RAM", bad_n == 0); kprintf("  4x64KB fill+check %llu us\n", (t1 - t0) * 1000000ULL / f);
+    }
+#endif
+    summary();
+    int fr = log_flush(); kprintf("final log flush: %d\n", fr);
+}
+#endif
+
+#define SRC_VER "src5"
 void kmain(const void *dtb) {
     fb_clear();
-    kcolor(C_CYAN); kprintf("KB LOADER (C) %s %s\n", BUILD_TAG, RISKY == 2 ? "EMMC" : RISKY ? "FULL" : "SAFE"); kcolor(C_WHITE);
-#if RISKY != 2
+    kcolor(C_CYAN); kprintf("KB LOADER (C) %s %s %s\n", BUILD_TAG, RISKY == 4 ? "MMU" : RISKY == 3 ? "LOG" : RISKY ? "FULL" : "SAFE", SRC_VER); kcolor(C_WHITE);
+#if RISKY < 3
     cpu_info();
 #endif
     kprintf("x0(DTB) = %llx\n", (u64)(uintptr_t)dtb);
+#if RISKY >= 3
+    stage_main((const u8 *)dtb);
+#else
     fdt_walk((const u8 *)dtb, RISKY == 0);
 #if RISKY == 1
     risky_tests();
-#elif RISKY == 2
-    emmc_test();
 #endif
     kcolor(C_YEL); kprintf("\nDONE. Photo the screen.\n"); kcolor(C_WHITE);
+#endif
     for (;;) { WFI();
 #ifdef HOST_TEST
         return;
