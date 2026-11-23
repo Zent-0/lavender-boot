@@ -33,9 +33,11 @@ extern void host_wr32(u64 addr, u32 v);
 #define ISB() do {} while (0)
 extern void host_pump_irq(void);
 extern u64 host_mpidr;
+extern u64 host_iar;
+extern u64 host_gicsr(const char *n);
 #define IRQ_ON()  host_pump_irq()
 #define IRQ_OFF() do {} while (0)
-#define GICSR_R(enc) ((u64)27)
+#define GICSR_R(enc) host_gicsr(#enc)
 #define GICSR_W(enc, v) do { (void)(v); } while (0)
 #define CNTV_ARM(tv) do { (void)(tv); } while (0)
 #define CNTV_OFF() do {} while (0)
@@ -156,6 +158,7 @@ static u64 gic_base;           /* first reg of first interrupt-controller@ node 
 static u64 gicr_base;          /* second reg entry of it */
 static u64 cpu_reg[8]; static u32 ncpu;
 static u64 sdhci_base;
+static u32 timer_intid[4] = { 0, 0, 0, 0 }; static int have_timer_dt;       /* [0]=sec phys [1]=ns phys [2]=virt [3]=hyp */
 static u64 sdhci_reg[4], sdhci_regsz[4]; static u32 sdhci_nreg; static const char *sdhci_regnames; static u32 sdhci_regnames_len;
 
 struct nstk { char name[48]; u32 ac, sc; };
@@ -214,6 +217,10 @@ static void fdt_walk(const u8 *dtb, int verbose) {
             if (startswith(path, "/cpus/cpu@") && streq(pn, "reg") && ncpu < 8) cpu_reg[ncpu++] = rcells(val, pac);
             if (streq(path, "/psci") && verbose) { if (streq(pn, "method")) kprintf("PSCI method %s\n", (const char *)val); }
             if (sel_depth == depth && streq(pn, "compatible") && verbose) kprintf("%.30s %.17s\n", st[depth].name, (const char *)val);
+            if (depth == 2 && streq(st[depth].name, "timer") && streq(pn, "interrupts") && len >= 48) {
+                for (u32 i = 0; i < 4; i++) { u32 ty = be32(val + 12 * i), nm = be32(val + 12 * i + 4); timer_intid[i] = (ty == 1 ? 16u : 32u) + nm; }
+                have_timer_dt = 1;
+            }
             if (startswith(st[depth].name, "interrupt-controller@") && depth == 2 && streq(pn, "reg") && !gic_base) {
                 gic_base = rcells(val, pac);
                 if (len >= (pac + psc) * 8) gicr_base = rcells(val + (pac + psc) * 4, pac);
@@ -306,7 +313,7 @@ static u32 dma_area[2048] __attribute__((aligned(4096)));
 #define adma_desc ((u32 *)(DMA_PTR + 0x400))
 #define wbuf      ((u8 *)(DMA_PTR + 0x800))
 struct smp_shared {
-    volatile u32 state[8], ticks[8], other[8], pend[8], tctl[8];
+    volatile u32 state[8], ticks[8], other[8], pend[8], tctl[8], grp[8], en[8], cur[8], used[8];
     volatile u64 mpidr[8], midr[8], rd[8], exc_esr[8], exc_elr[8], exc_far[8];
 };
 #define SHARED ((struct smp_shared *)(DMA_PTR + 0x1000))
@@ -538,7 +545,7 @@ static int gic_cpuif_init(void) {
 static void irq_handler(void) {
     u64 iar = GICSR_R(S3_0_C12_C12_0);                           /* ICC_IAR1_EL1 */
     u32 id = (u32)(iar & 0xFFFFFF), c = cpu_id_of(SYSREG(mpidr_el1));
-    if (id == 27) {                                              /* virtual timer PPI */
+    if (id == SHARED->cur[c]) {                                  /* virtual timer PPI (number chosen at run time) */
         CNTV_OFF();
         u32 t = SHARED->ticks[c] + 1; SHARED->ticks[c] = t;
         if (t < TIMER_TICKS_WANTED) CNTV_ARM(SYSREG(cntfrq_el0) / 100);   /* re-arm for 10 ms */
@@ -556,15 +563,23 @@ static void cpu_body(u32 id, u64 mp, int secondary) {
     SHARED->state[id] |= 4; DSB();
     if (gic_cpuif_init() < 0) return;
     SHARED->state[id] |= 8; DSB();
-    SHARED->ticks[id] = 0;
-    WR32(rd + 0x10000 + 0x100, 1u << 27);                        /* ISENABLER0: virtual timer PPI (INTID 27) */
-    CNTV_ARM(SYSREG(cntfrq_el0) / 100);
-    IRQ_ON();
-    u64 f = SYSREG(cntfrq_el0), t0 = cnt();
-    while (SHARED->ticks[id] < TIMER_TICKS_WANTED && (cnt() - t0) < f / 2) { }
-    IRQ_OFF(); CNTV_OFF();
-    SHARED->pend[id] = RD32(rd + 0x10000 + 0x200); SHARED->tctl[id] = 0;
-    if (SHARED->ticks[id] >= TIMER_TICKS_WANTED) SHARED->state[id] |= 16;
+    u32 cand[2], nc = 0, vi = have_timer_dt ? timer_intid[2] : 27;
+    if (vi >= 16 && vi < 32) cand[nc++] = vi;
+    if (vi != 27) cand[nc++] = 27;
+    u64 sgi = rd + 0x10000, f = SYSREG(cntfrq_el0);
+    for (u32 ci = 0; ci < nc && !(SHARED->state[id] & 16); ci++) {
+        u32 iid = cand[ci]; SHARED->cur[id] = iid; SHARED->ticks[id] = 0;
+        WR32(sgi + 0x100, 1u << iid);                            /* ISENABLER0 */
+        CNTV_ARM(f / 100);
+        IRQ_ON();
+        u64 t0 = cnt();
+        while (SHARED->ticks[id] < TIMER_TICKS_WANTED && (cnt() - t0) < f / 2) { }
+        SHARED->pend[id] = RD32(sgi + 0x200); SHARED->grp[id] = RD32(sgi + 0x80); SHARED->en[id] = RD32(sgi + 0x100);
+        SHARED->tctl[id] = (u32)SYSREG(cntv_ctl_el0);
+        IRQ_OFF(); CNTV_OFF();
+        WR32(sgi + 0x180, 1u << iid);                            /* ICENABLER0 */
+        if (SHARED->ticks[id] >= TIMER_TICKS_WANTED) { SHARED->state[id] |= 16; SHARED->used[id] = iid; }
+    }
     DSB();
 }
 #if RISKY == 5
@@ -572,7 +587,9 @@ static u8 cpu_stack[8][8192] __attribute__((aligned(16)));
 void secondary_main(void) { u64 mp = SYSREG(mpidr_el1); cpu_body(cpu_id_of(mp), mp, 1); for (;;) WFI(); }
 #endif
 #ifdef HOST_TEST
-void host_pump_irq(void) { for (int i = 0; i < TIMER_TICKS_WANTED; i++) irq_handler(); }
+u64 host_iar;
+u64 host_gicsr(const char *n) { return streq(n, "S3_0_C12_C12_0") ? host_iar : 1; }
+void host_pump_irq(void) { host_iar = SHARED->cur[cpu_id_of(host_mpidr)]; for (int i = 0; i < TIMER_TICKS_WANTED; i++) irq_handler(); }
 void host_cpu_started(u64 mp) { u64 keep = host_mpidr; host_mpidr = mp | 0x80000000ULL; cpu_body(cpu_id_of(mp), host_mpidr, 1); host_mpidr = keep; }
 #endif
 
@@ -620,7 +637,9 @@ static void stage_main(const u8 *dtb) {
         cpu_body(0, SYSREG(mpidr_el1), 0);
         u32 st = SHARED->state[0];
         stage("GICR", (st & 4) != 0); stage("GICC", (st & 8) != 0); stage("IRQ", (st & 16) != 0);
-        kprintf("  rd %llx ticks %u other %u pend %08x\n", SHARED->rd[0], SHARED->ticks[0], SHARED->other[0], SHARED->pend[0]);
+        kprintf("timer INTIDs %u %u %u %u (DT %d)\n", timer_intid[0], timer_intid[1], timer_intid[2], timer_intid[3], have_timer_dt);
+        kprintf("  used %u ticks %u other %u ctl %x\n", SHARED->used[0], SHARED->ticks[0], SHARED->other[0], SHARED->tctl[0]);
+        kprintf("  pend %08x grp %08x en %08x\n", SHARED->pend[0], SHARED->grp[0], SHARED->en[0]);
         log_flush();
         u32 up = 0; s64 cr[8] = {0};
         for (u32 i = 1; i < ncpu && i < 8; i++) {
@@ -648,7 +667,7 @@ static void stage_main(const u8 *dtb) {
 }
 #endif
 
-#define SRC_VER "src6"
+#define SRC_VER "src7"
 void kmain(const void *dtb) {
     fb_clear();
     kcolor(C_CYAN); kprintf("KB LOADER (C) %s %s %s\n", BUILD_TAG, RISKY == 5 ? "IRQ" : RISKY == 4 ? "MMU" : RISKY == 3 ? "LOG" : RISKY ? "FULL" : "SAFE", SRC_VER); kcolor(C_WHITE);
