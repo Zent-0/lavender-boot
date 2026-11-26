@@ -314,7 +314,7 @@ static u32 dma_area[2048] __attribute__((aligned(4096)));
 #define wbuf      ((u8 *)(DMA_PTR + 0x800))
 struct smp_shared {
     volatile u32 state[8], ticks[8], other[8], pend[8], tctl[8], grp[8], en[8], cur[8], used[8];
-    volatile u64 mpidr[8], midr[8], rd[8], exc_esr[8], exc_elr[8], exc_far[8];
+    volatile u64 mpidr[8], midr[8], mmfr0[8], rd[8], exc_esr[8], exc_elr[8], exc_far[8];
 };
 #define SHARED ((struct smp_shared *)(DMA_PTR + 0x1000))
 static u32 cpu_id_of(u64 mp) { return (u32)(((mp & 0xff) + 4 * ((mp >> 8) & 0xff)) & 7); }
@@ -555,7 +555,7 @@ static void irq_handler(void) {
 }
 /* per-CPU body, shared by core 0 and the secondaries */
 static void cpu_body(u32 id, u64 mp, int secondary) {
-    SHARED->mpidr[id] = mp; SHARED->midr[id] = SYSREG(midr_el1); SHARED->state[id] |= 1; DSB();
+    SHARED->mpidr[id] = mp; SHARED->midr[id] = SYSREG(midr_el1); SHARED->mmfr0[id] = SYSREG(id_aa64mmfr0_el1); SHARED->state[id] |= 1; DSB();
     if (secondary) { if (!mmu_on()) return; }
     SHARED->state[id] |= 2; DSB();
     u64 rd = gic_find_rd(mp); SHARED->rd[id] = rd;
@@ -637,6 +637,7 @@ static void stage_main(const u8 *dtb) {
         cpu_body(0, SYSREG(mpidr_el1), 0);
         u32 st = SHARED->state[0];
         stage("GICR", (st & 4) != 0); stage("GICC", (st & 8) != 0); stage("IRQ", (st & 16) != 0);
+        kprintf("c0 mmfr0 %llx tgran16 %u\n", SHARED->mmfr0[0], (u32)((SHARED->mmfr0[0] >> 20) & 0xf));
         kprintf("timer INTIDs %u %u %u %u (DT %d)\n", timer_intid[0], timer_intid[1], timer_intid[2], timer_intid[3], have_timer_dt);
         kprintf("  used %u ticks %u other %u ctl %x\n", SHARED->used[0], SHARED->ticks[0], SHARED->other[0], SHARED->tctl[0]);
         kprintf("  pend %08x grp %08x en %08x\n", SHARED->pend[0], SHARED->grp[0], SHARED->en[0]);
@@ -656,6 +657,7 @@ static void stage_main(const u8 *dtb) {
         for (u32 i = 1; i < ncpu && i < 8; i++) {
             u32 s2 = SHARED->state[cpu_id_of(cpu_reg[i])];
             kprintf("c%u on%d mp%llx m%llx s%x t%u\n", i, (int)cr[i], SHARED->mpidr[i], SHARED->midr[i], s2, SHARED->ticks[i]);
+            kprintf("   mmfr0 %llx tgran16 %u\n", SHARED->mmfr0[cpu_id_of(cpu_reg[i])], (u32)((SHARED->mmfr0[cpu_id_of(cpu_reg[i])] >> 20) & 0xf));
             if (SHARED->exc_esr[i]) kprintf("  EXC esr %llx elr %llx far %llx\n", SHARED->exc_esr[i], SHARED->exc_elr[i], SHARED->exc_far[i]);
             if (s2 & 16) up++;
         }
