@@ -442,11 +442,12 @@ static void summary(void) {
 static u64 cnt(void);
 #ifdef HOST_TEST
 static void mmu_build(void) { }
-static int mmu_on(void) { return 1; }
+static int mmu_on(int g16) { (void)g16; return 1; }
 static int mmu_enable(void) { kprintf("(host: MMU skipped)\n"); return 1; }
 #else
 static u64 l1_tab[512] __attribute__((aligned(4096)));
 static u64 l2_tab[512] __attribute__((aligned(4096)));
+static u64 l2_16k[2048] __attribute__((aligned(16384)));   /* 16K granule, 36-bit VA, start at L2: 2048 x 32 MiB blocks */
 #define PTE_BLK   0x1ULL
 #define PTE_TBL   0x3ULL
 #define PTE_AF    (1ULL << 10)
@@ -466,15 +467,25 @@ static void mmu_build(void) {
     for (u64 i = 0; i < 16; i++) l2_tab[i]      = (0x80000000ULL + i * 0x200000) | PTE_BLK | PTE_AF | PTE_ISH | PTE_IDX(1);                 /* 32 MiB WB: image, stack, tables */
     for (u64 i = 16; i < 32; i++) l2_tab[i]     = (0x80000000ULL + i * 0x200000) | PTE_BLK | PTE_AF | PTE_ISH | PTE_IDX(2) | PTE_XN;        /* 32 MiB NC: DMA + shared buffers */
     for (u64 i = 234; i < 252; i++) l2_tab[i]   = (0x80000000ULL + i * 0x200000) | PTE_BLK | PTE_AF | PTE_IDX(0) | PTE_XN;                    /* framebuffer 0x9d400000.. as device */
+    /* 16K-granule copy of the same map (used by the A73-class gold cores): 32 MiB blocks */
+    memset(l2_16k, 0, sizeof l2_16k);
+    for (u64 i = 0; i < 64; i++) l2_16k[i] = (i * 0x2000000ULL) | PTE_BLK | PTE_AF | PTE_IDX(0) | PTE_XN;                    /* 0..2G peripherals */
+    l2_16k[64] = 0x80000000ULL | PTE_BLK | PTE_AF | PTE_ISH | PTE_IDX(1);                                                    /* 32 MiB WB: image, stack, tables */
+    l2_16k[65] = 0x82000000ULL | PTE_BLK | PTE_AF | PTE_ISH | PTE_IDX(2) | PTE_XN;                                           /* 32 MiB NC: DMA + shared buffers */
+    for (u64 i = 78; i < 80; i++) l2_16k[i] = (i * 0x2000000ULL) | PTE_BLK | PTE_AF | PTE_IDX(0) | PTE_XN;                  /* framebuffer area as device */
     dcache_inval(0x80000000ULL, 0x200000);          /* drop stale lines over our image / bss / stack / tables */
     dcache_inval(0x82100000ULL, 0x10000);           /* and over the DMA buffers */
     __asm__ volatile("dsb sy" ::: "memory");
 }
 /* turn the MMU + caches on for the calling CPU (tables must already be built) */
-static int mmu_on(void) {
+static int mmu_on(int g16) {
     u64 mair = 0x44FF00ULL;
     u64 tcr  = 25ULL | (1ULL << 8) | (1ULL << 10) | (3ULL << 12) | (1ULL << 23) | (2ULL << 32);   /* 39-bit VA, 4K, WB walks, 40-bit PA */
     u64 ttbr = (u64)(uintptr_t)l1_tab;
+    if (g16) {                                                                                   /* 36-bit VA, 16K granule (TG0 = 0b10) */
+        tcr  = 28ULL | (1ULL << 8) | (1ULL << 10) | (3ULL << 12) | (2ULL << 14) | (1ULL << 23) | (2ULL << 32);
+        ttbr = (u64)(uintptr_t)l2_16k;
+    }
     u64 sctlr = SYSREG(sctlr_el1); sctlr |= (1ULL << 0) | (1ULL << 2) | (1ULL << 12); sctlr &= ~(1ULL << 19);
     __asm__ volatile(
         "dsb sy\n"
@@ -493,7 +504,7 @@ static int mmu_on(void) {
         :: "r"(mair), "r"(tcr), "r"(ttbr), "r"(sctlr) : "memory");
     return (SYSREG(sctlr_el1) & 0x1005) == 0x1005;
 }
-static int mmu_enable(void) { mmu_build(); return mmu_on(); }
+static int mmu_enable(void) { mmu_build(); return mmu_on(0); }
 #endif
 /* ------------------------------------------------------------ GICv3 + virtual timer IRQ + SMP bring-up */
 static u64 gicd_base, gicr_base_addr;
@@ -553,10 +564,18 @@ static void irq_handler(void) {
     } else if (id < 1020) { SHARED->other[c] = id; GICSR_W(S3_0_C12_C12_1, iar); }
     else SHARED->other[c] = id;                                  /* spurious */
 }
+static u8 cpu_mt[8][4096];
 /* per-CPU body, shared by core 0 and the secondaries */
 static void cpu_body(u32 id, u64 mp, int secondary) {
     SHARED->mpidr[id] = mp; SHARED->midr[id] = SYSREG(midr_el1); SHARED->mmfr0[id] = SYSREG(id_aa64mmfr0_el1); SHARED->state[id] |= 1; DSB();
-    if (secondary) { if (!mmu_on()) return; }
+    if (secondary) {
+        int g16 = ((SYSREG(id_aa64mmfr0_el1) >> 20) & 0xf) == 1;       /* 16K granule supported (gold / A73-class cores) */
+        if (!mmu_on(g16)) return;
+        if (g16) SHARED->state[id] |= 0x20;                           /* running on the 16K-granule tables */
+        { u8 *m = cpu_mt[id]; u32 bad = 0; for (u32 k = 0; k < 4096; k++) m[k] = (u8)(k * 7 + id);
+          for (u32 k = 0; k < 4096; k++) if (m[k] != (u8)(k * 7 + id)) bad++;
+          if (!bad) SHARED->state[id] |= 0x40; }                      /* private RAM fill+check passed */
+    }
     SHARED->state[id] |= 2; DSB();
     u64 rd = gic_find_rd(mp); SHARED->rd[id] = rd;
     if (!rd || gic_rd_init(rd) < 0) return;
